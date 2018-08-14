@@ -10,57 +10,20 @@ import json
 from dateutil.parser import parse
 import time
 from datetime import datetime
-
-
-import sqlite3
-
 import numpy as np
 import pandas
 from scipy.stats import itemfreq, norm, rankdata
-
 from sklearn.metrics import roc_auc_score, f1_score, precision_recall_curve, auc
-
 # needed because of an rpy2 linking bug
 import readline
 import rpy2
 import rpy2.robjects.numpy2ri
 rpy2.robjects.numpy2ri.activate()
 import rpy2.robjects as ro
+import argparse
+import warnings
 
-import synapseclient
-from synapseclient import Evaluation, Submission, SubmissionStatus
-import challenge_config as conf
-
-USER = ''
-PASS = ''
-
-#FINAL_LABELS_BASEDIR = "/mnt/data/TF_binding/DREAM_challenge/hidden_test_set_chipseq_data/tsvs/"
-#VALIDATION_LABELS_BASEDIR = "/mnt/data/leaderboard_labels_w_chr8/"
-#FINAL_LABELS_BASEDIR = "/mnt/data/hidden_test_set_chipseq_data/"
-#FINAL_LABELS_BASEDIR = "/mnt/data/hidden_test_set_chipseq_data_whole_genome/"
-FINAL_LABELS_BASEDIR = "/mnt/data/TF_binding/DREAM_challenge/hidden_test_set_chipseq_data/tsvs" # whole genome
-FINAL_WITHIN_LABELS_BASEDIR = "/mnt/data/final_within_fake_lables/" # whole genome
-VALIDATION_LABELS_BASEDIR = "/mnt/data/leaderboard_labels_w_chr8/"
-#DB = "/encode/final2/bootrapped_scores.db"
-#SUBMISSIONS_DIR = "/encode/final2/submissions/"
-#SUBMISSIONS_DIR = "/encode/final2/test_submissions/"
-
-# DB = "/srv/scratch/leepc12/DREAM_challenge/final2/filtered_bootstrapped_scores.db"
-# DB = "/users/leepc12/code/EncodeChallenge/final2/final2_true.db"
-# DB = "/users/leepc12/code/EncodeChallenge/final2/final1_true.db"
-# DB = "/users/leepc12/code/EncodeChallenge/final2/final_1_and_2_with_10_fold.db"
-
-#DB = "/users/leepc12/code/EncodeChallenge/final2/final_1_and_2_with_10_fold_final2_participants_have_high_synapseId.db"
-DB = "final2/final_1_and_2_with_10_fold_final2_participants_have_high_synapseId.db"
-
-SUBMISSIONS_DIR = "/srv/scratch/leepc12/DREAM_challenge/final2/filtered_submissions/"
-
-# DB = "/mnt/data/TF_binding/DREAM_challenge/final1/bootstrapped_scores.db"
-# SUBMISSIONS_DIR = "/mnt/data/TF_binding/DREAM_challenge/final1/test_submissions/"
-
-
-syn = synapseclient.Synapse()
-syn.login(email=USER, password=PASS)
+# FINAL_LABELS_BASEDIR = "/mnt/data/TF_binding/DREAM_challenge/hidden_test_set_chipseq_data/tsvs" # whole genome
 
 def optional_gzip_open(fname):
     return gzip.open(fname) if fname.endswith(".gz") else open(fname)  
@@ -69,11 +32,8 @@ def optional_gzip_open(fname):
 MEASURE_NAMES = ['recall_at_10_fdr', 'recall_at_50_fdr', 'auPRC', 'auROC']
 ValidationResults = namedtuple('ValidationResults', MEASURE_NAMES)
 
-# match filenames of the form (optional.part.){L,F,B}.[TF].[cell-line].tab.gz
-fname_pattern = "[0-9\.]*([LFB])\.(.+?)\.(.+?).tab(?:\(\d+\))?.gz$"
-
 def recall_at_fdr(y_true, y_score, fdr_cutoff=0.05):
-    print(y_true, y_score)
+    # print y_true, y_score
     precision, recall, thresholds = precision_recall_curve(y_true, y_score)
     fdr = 1- precision
     cutoff_index = next(i for i, x in enumerate(fdr) if x <= fdr_cutoff)
@@ -207,96 +167,6 @@ class ClassificationResult(object):
             self.negative_accuracy, self.num_true_negatives, self.num_negatives))
         return "\t".join(rv)
 
-
-def build_sample_test_file(truth_fname, score_column_index, output_fname):
-    ofp = open(output_fname, "w")
-    with optional_gzip_open(truth_fname) as fp:
-        for i, line in enumerate(fp):
-            # skip the header
-            if i == 0: continue
-            if i%1000000 == 0: print("Finished processing line", i)
-            data = line.split()
-            region = data[:3]
-            label = data[score_column_index]
-            if label == 'U':
-                score = random.uniform(0, 0.8)
-            elif label == 'A':
-                score = random.uniform(0.5, 0.9)
-            elif label == 'B':
-                score = random.uniform(0.7, 1.0)
-            data = region + [score,]
-            ofp.write("{}\t{}\t{}\t{}\n".format(*data))
-    ofp.close()
-    return 
-
-def verify_file_and_build_scores_array(
-        truth_fname, submitted_fname, labels_index):
-    # make sure the region entries are identical and that
-    # there is a float for each entry
-    truth_fp_iter = iter(optional_gzip_open(truth_fname))
-    submitted_fp_iter = iter(optional_gzip_open(submitted_fname))
-
-    # skip the header
-    next(truth_fp_iter)
-    
-    scores = []
-    labels = []
-    t_line_num, s_line_num, s_scored_line_num = 0, 0, 0
-    while True:
-        # get the next line
-        try:
-            t_line = next(truth_fp_iter)
-            t_line_num += 1
-            s_line = next(submitted_fp_iter)
-            s_line_num += 1
-            s_scored_line_num += 1
-        except StopIteration:
-            break
-        
-        # parse the truth line
-        t_match = re.findall("(\S+\t\d+\t\d+)\t(.+?)\n", t_line)
-        assert len(t_match) == 1, \
-            "Line %i in the labels file did not match the expected pattern '(\S+\t\d+\t\d+)\t(.+?)\n'" % t_line_num
-        
-        # parse the submitted file line, raising an error if it doesn't look
-        # like expected
-        s_match = re.findall("(\S+\t\d+\t\d+)\t(\S+)\n", s_line)
-        if len(s_match) != 1:
-            raise InputError("Line %i in submitted file does not conform to the required pattern: '(\S+\t\d+\t\d+)\t(\S+)\n'" 
-                             % t_line_num)
-        if t_match[0][0] != s_match[0][0]:
-            raise InputError("Line %i in submitted file does not match line %i in the reference regions file" 
-                             % (t_line_num, s_line_num))
-
-        # parse and validate the score
-        try:
-            score = float(s_match[0][1])
-        except ValueError:
-            raise InputError("The score at line %i in the submitted file can not be interpreted as a float" % s_line_num)
-        scores.append(score)
-
-        # add the label
-        region_labels = t_match[0][-1].split()
-        assert all(label in 'UAB' for label in region_labels), "Unrecognized label '{}'".format(
-            region_labels)
-        region_label = region_labels[labels_index]
-        if region_label == 'A':
-            labels.append(-1)
-        elif region_label == 'B':
-            labels.append(1)
-        elif region_label == 'U':
-            labels.append(0)
-        else:
-            assert False, "Unrecognized label '%s'" % region_label
-
-    # make sure the files have the same number of lines
-    if t_line_num < s_scored_line_num:
-        raise InputError("The submitted file has more rows than the reference file")
-    if t_line_num > s_scored_line_num:
-        raise InputError("The reference file has more rows than the reference file")
-    
-    return np.array(labels), np.array(scores)
-
 def build_ref_scores_array(ref_fname):
     factor = os.path.basename(ref_fname).split(".")[0]
     
@@ -320,116 +190,21 @@ def build_ref_scores_array(ref_fname):
 def build_submitted_scores_array(fname):
     df = pandas.read_csv(
         fname, names=["chr", "start", "stop", "sample"], sep="\t")
-    return df['sample'].values
+    # return df['sample'].values
+    df2 = df[df.chr.str.contains(r'^chr(1|8|21)$',regex=True)]
+    return df2['sample'].values
 
-def verify_and_score_submission(ref_fname, submitted_fname,label_index):
-    # build the label and score matrices
-    labels, scores = verify_file_and_build_scores_array(
-        ref_fname, submitted_fname, label_index)
-
-    # compute the measures on the full submitted scores
-    full_results = ClassificationResult(labels, scores.round(), scores)
-    results = ValidationResults(*[
-        getattr(full_results, attr_name) for attr_name in MEASURE_NAMES])
-
-    return results, labels, scores
-
-def test_main():
-    # labels_file = sys.argv[1]
-    # build_sample_test_file(labels_file, 3, "test.scores")
-    # submission_file = "test.scores"
-    labels_file = "/mnt/data/TF_binding/DREAM_challenge/hidden_test_set_chipseq_data/tsvs/JUND.train.labels.tsv.gz"
-    submission_file="/srv/scratch/leepc12/DREAM_challenge/final2/submissions_failed/3342173.8012980.F.JUND.liver.tab.gz"
-    cell_line="liver"
-
-    header_data = None
-    with gzip.open(labels_file) as fp:
-        header_data = next(fp).split()
-    # Make sure the header looks right
-    assert header_data[:3] == ['chr', 'start', 'stop']
-    labels_file_samples = header_data[3:]
-
-    label_index = labels_file_samples.index(cell_line)
-    # labels, scores = verify_file_and_build_scores_array(
-    #     labels_file, submission_file, label_index)
-
-    results, labels, scores = verify_and_score_submission(labels_file, submission_file,label_index)
-    calc_bootstrapped_scores( labels, scores )
-    print(results)
-
-def score_two_files_main():
-    try:
-        labels_fname = sys.argv[1]
-        submission_fname = sys.argv[2]
-    except IndexError:
-        print("usage: python score.py labels_fname submission_fname")
-        sys.exit(0)
-    labels, scores = verify_file_and_build_scores_array(
-        labels_fname, submission_fname)
-    full_results = ClassificationResult(labels, scores.round(), scores)
-    print(full_results)
-
-def score_main(submission_fname):
+def score_final_main(submission_fname,label_dir):
     # load and parse the submitted filename
+    fname_pattern = "^[FBL]\.(.+?)\.(.+?)\.tab.gz"
     res = re.findall(fname_pattern, os.path.basename(submission_fname))
-    if len(res) != 1 or len(res[0]) != 3:
-        raise InputError("The submitted filename ({}) does not match expected naming pattern '{}'".format(
-            submission_fname, fname_pattern))
-    else:
-        submission_type, factor, cell_line = res[0]
-    
+    if len(res) != 1 or len(res[0]) != 2:
+        raise InputError, "The submitted filename ({}) does not match expected naming pattern '{}'".format(
+            submission_fname, fname_pattern)
+    else:        
+        factor, cell_line = res[0]
     # find a matching validation file
-    labels_fname = os.path.join(VALIDATION_LABELS_BASEDIR, "{}.labels.tsv.gz".format(factor))
-    # validate that the matching file exists and that it contains labels that 
-    # match the submitted sample 
-    header_data = None
-    try:
-        with gzip.open(labels_fname) as fp:
-            header_data = next(fp).split()
-    except IOError:
-        raise InputError("The submitted factor, sample combination ({}, {}) is not a valid leaderboard submission.".format(
-            factor, cell_line))
-
-    # Make sure the header looks right
-    assert header_data[:3] == ['chr', 'start', 'stop']
-    labels_file_samples = header_data[3:]
-    # We only expect to see one sample per leaderboard sample
-    if cell_line not in labels_file_samples:
-        raise InputError("The submitted factor, sample combination ({}, {}) is not a valid leaderboard submission.".format(
-            factor, cell_line))
-
-    label_index = labels_file_samples.index(cell_line)
-    labels, scores = verify_file_and_build_scores_array(
-        labels_fname, submission_fname, label_index)
-    full_results = ClassificationResult(labels, scores.round(), scores)
-    return full_results, labels, scores
-
-def calc_bootstrapped_scores(labels, scores):
-    from sklearn.cross_validation import StratifiedKFold
-    for i, (indices, _) in enumerate(
-            StratifiedKFold(labels, n_folds=10, random_state=0)):
-        results = ClassificationResult(
-            labels[indices], scores[indices].round(), scores[indices])
-        yield i, results
-    return
-
-
-def score_final_main(submission_fname):
-    # load and parse the submitted filename
-    # 3343330.7278071.1474630242.F.NANOG.induced_pluripotent_stem_cell.tab.gz
-    fname_pattern = "(.+?)\.(.+?)\.F\.(.+?)\.(.+?)\.tab.gz"
-    #fname_pattern = "(.+?)\.(.+?)\.FSUBSET\.(\d+)\.tab.gz"
-    res = re.findall(fname_pattern, os.path.basename(submission_fname))
-    #print res, len(res), len(res[0])
-    #if len(res) != 1 or len(res[0]) != 3:
-    if len(res) != 1 or len(res[0]) != 4:
-        raise InputError("The submitted filename ({}) does not match expected naming pattern '{}'".format(
-            submission_fname, fname_pattern))
-    else:
-        #factor, cell_line, team_id = res[0]
-        teamid, _, factor, cell_line = res[0]
-    # find a matching validation file
-    labels_fname = os.path.join(FINAL_LABELS_BASEDIR, "{}.train.labels.tsv.gz".format(factor))
+    labels_fname = os.path.join(label_dir, "{}.train.labels.tsv.gz".format(factor))
     # validate that the matching file exists and that it contains labels that 
     # match the submitted sample 
     header_data = None
@@ -446,67 +221,39 @@ def score_final_main(submission_fname):
     if cell_line not in labels_file_samples:
         raise InputError("The submitted factor, sample combination ({}, {}) is not a valid final submission.".format(
             factor, cell_line))
-
     try:
         scores = build_submitted_scores_array(submission_fname)
         labels = build_ref_scores_array(labels_fname)[cell_line]
     # JIN
         full_results = ClassificationResult(labels, scores.round(), scores)
     except:
-        print("ERROR", submission_fname)
+        print "ERROR", submission_fname
         sys.stdout.flush()
 
     return full_results, labels, scores
-
-def score_final_within_celltype_main(submission_fname):
-    # load and parse the submitted filename
-    # 3343330.7278071.1474630242.F.NANOG.induced_pluripotent_stem_cell.tab.gz
-    fname_pattern = "F\.(.+?)\.(.+?)\.tab.gz"
-    #fname_pattern = "(.+?)\.(.+?)\.FSUBSET\.(\d+)\.tab.gz"
-    res = re.findall(fname_pattern, os.path.basename(submission_fname))
-    #print res, len(res), len(res[0])
-    if len(res) != 1 or len(res[0]) != 3:
-    #if len(res) != 1 or len(res[0]) != 4:
-        raise InputError("The submitted filename ({}) does not match expected naming pattern '{}'".format(
-            submission_fname, fname_pattern))
-    else:
-        #factor, cell_line, team_id = res[0]
-        teamid, _, factor, cell_line = res[0]
-    # find a matching validation file
-    # labels_fname = os.path.join(FINAL_LABELS_BASEDIR, "{}.train.labels.tsv.gz".format(factor))
-    labels_fname = os.path.join(FINAL_WITHIN_LABELS_BASEDIR, "{}.train.labels.tsv.gz".format(factor))    
-    # validate that the matching file exists and that it contains labels that 
-    # match the submitted sample 
-    header_data = None
-    try:
-        with gzip.open(labels_fname) as fp:
-            header_data = next(fp).split()
-    except IOError:
-        raise InputError("The submitted factor, sample combination ({}, {}) is not a valid final submission.".format(
-            factor, cell_line))
-    # Make sure the header looks right
-    assert header_data[:3] == ['chr', 'start', 'stop']
-    labels_file_samples = header_data[3:]
-    # We only expect to see one sample per leaderboard sample
-    if cell_line not in labels_file_samples:
-        raise InputError("The submitted factor, sample combination ({}, {}) is not a valid final submission.".format(
-            factor, cell_line))
-
-    scores = build_submitted_scores_array(submission_fname)
-    labels = build_ref_scores_array(labels_fname)[cell_line]
-    # JIN
-    full_results = ClassificationResult(labels, scores.round(), scores)
-    return full_results, labels, scores
+    # print scores
 
 def main():
-    try:
-        submission_fname = sys.argv[1]
-    except IndexError:
-        print("usage: python score.py submission_fname")
-        sys.exit(0)
-    results, labels, scores = score_main(submission_fname)
-    print(results)
+    parser = argparse.ArgumentParser(prog='Scoring script for ENCODE-DREAM in vivo Transcription Factor Binding Site Prediction Challenge', 
+        description='''
+        For leaderboard, use label at Files/Challenge Resources/scoring_script/labels/leaderboard.
+        For final/within, use label at Files/Challenge Resources/scoring_script/labels/final.
+        ''')
+    parser.add_argument('submission_fname', metavar='submission_fname', type=str,
+                            help='Submission file name should match with pattern [L/F/B].[TF_NAME].[CELL_TYPE].gz.')
+    parser.add_argument('label_dir', metavar='label_dir', type=str,
+                            help='Directory containing label files. Label files should have a format of [TF_NAME].train.labels.tsv.gz. Download at Files/Challenge Resources/scoring_script/labels')
+   
+    args = parser.parse_args()    
+    warnings.simplefilter(action='ignore', category=UserWarning)
+    results, labels, scores = score_final_main(args.submission_fname,args.label_dir)
+    print results
 
 if __name__ == '__main__':
-    #main()
-    test_main()
+    main()
+
+'''
+python score.py ~/F.HNF4A.liver.tab.gz /mnt/data/TF_binding/DREAM_challenge/all_labels/final
+python score.py ~/B.HNF4A.liver.tab.gz /mnt/data/TF_binding/DREAM_challenge/all_labels/within
+python score.py ~/L.CTCF.GM12878.tab.gz /mnt/data/TF_binding/DREAM_challenge/all_labels/leaderboard
+'''
