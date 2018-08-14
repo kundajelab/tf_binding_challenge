@@ -33,17 +33,18 @@ Scoring script takes in two positional parameters.
 ## Ranking script
 There are two steps for the ranking script.
 
-1) Calculate bootstrapped score for each submission file and generate a MySQL3 database file `score_final.db` to store scores. This will take time. Give an good number of thread `--num-threads` to this job (default=4).
+1) Calculate bootstrapped score for each submission file and generate a MySQL3 database file `score_final.db` to store scores. This will take time. Give a good number of thread `--num-threads` to this job (default=4).
 	```
 	$ python rank.py --submissions-dir [SUBMISSION_DIR] --label-dir [LABEL_DIR] --num-threads 4
 	```
 
-SUBMISSION FILE NAMES IN `[SUBMISSION_DIR]` MUST MATCH THE FOLLOWING PATTERN. Any unique integer will be okay for `[TEAM_ID]` and `[SUBMISSION_ID]`.
+	SUBMISSION FILE NAMES IN `[SUBMISSION_DIR]` MUST MATCH THE FOLLOWING PATTERN. Any unique integer will be okay for `[TEAM_ID]` and `[SUBMISSION_ID]`.
 	```
 	[TEAM_ID].[SUBMISSION_ID].F.[TF].[CELL_LINE].tab.gz
 	```
 
-Example file names in `[SUBMISSION_DIR]`.
+	Example file names in `[SUBMISSION_DIR]`.
+
 	```
 	3319559.8006821.F.CTCF.PC-3.tab.gz
 	3319559.8006822.F.CTCF.induced_pluripotent_stem_cell.tab.gz
